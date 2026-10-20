@@ -99,8 +99,8 @@ void main_blinky(void)
     /* Create the queue for Measurement structures. */
     xQueue = xQueueCreate(1, sizeof(Measurement)); // <--- tutaj modyfikacja.
 
-    /* Create a binary semaphore and a mutex. */
-    xAlarmSemaphore = xSemaphoreCreateBinary();
+    /* Create a counting semaphore and a mutex. */
+    xAlarmSemaphore = xSemaphoreCreateCounting(5, 0);
     xConsoleMutex = xSemaphoreCreateMutex();
 
     if ((xQueue != NULL) &&
@@ -175,20 +175,22 @@ static void prvQueueSendTask(void* pvParameters)
         if (xQueueOverwrite(xQueue, &m) == pdPASS) // <--- tutaj modyfikacja.
         {
             if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
-            { // <--- tutaj modyfikacja.
+            {
                 printf(
                     "Monitoring: measurement %lu, temperature %.1f C\n",
                     (unsigned long)m.measurementNo,
                     (double)m.temperature
                 );
-
+                
                 xSemaphoreGive(xConsoleMutex);
             }
 
-            /* Signal the alarm task if temperature exceeds 75 C. */
+            /* Send several signals if temperature exceeds 75 C. */
             if (m.temperature > 75.0f) // <--- tutaj modyfikacja.
             {
                 xAlarmEvent = alarmTemperature; // <--- tutaj modyfikacja.
+                xSemaphoreGive(xAlarmSemaphore);
+                xSemaphoreGive(xAlarmSemaphore);
                 xSemaphoreGive(xAlarmSemaphore);
             }
         }
@@ -220,7 +222,7 @@ static void prvAlarmTask(void* pvParameters)
             {
                 printf(
                     xAlarmEvent == alarmTemperature
-                        ? "\n!!! ALARM: temperatura przekroczyla prog alarmowy 75 C !!!\n\n" // <--- tutaj modyfikacja.
+                        ? "\n!!! ALARM: temperatura przekroczyla prog alarmowy 75 C \n\n" // <--- tutaj modyfikacja.
                         : (xAlarmEvent == sensorFailure
                             ? "\n!!! AWARIA: brak nowych pomiarow z czujnika !!!\n\n" // <--- tutaj modyfikacja.
                             : "\nCzujnik ponownie wysyla pomiary. Powrot do pracy.\n\n") // <--- tutaj modyfikacja.
@@ -268,7 +270,7 @@ static void prvQueueReceiveTask(void* pvParameters)
                 xSemaphoreGive(xConsoleMutex);
             }
         }
-        else // <--- tutaj modyfikacja.
+        else 
         {
             if (xSensorFailureDetected == pdFALSE) // <--- tutaj modyfikacja.
             {
