@@ -1,75 +1,18 @@
-/*
- * FreeRTOS V202212.00
- * Copyright (C) 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy of
- * this software and associated documentation files (the "Software"), to deal in
- * the Software without restriction, including without limitation the rights to
- * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
- * the Software, and to permit persons to whom the Software is furnished to do so,
- * subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
- * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
- * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
- * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
- * https://www.FreeRTOS.org
- * https://github.com/FreeRTOS
- *
- */
-
- /* Standard includes. */
 #include <stdio.h>
-#include <conio.h>
 #include <stdint.h>
 
-/* Kernel includes. */
 #include "FreeRTOS.h"
 #include "task.h"
-#include "timers.h"
 #include "semphr.h"
+#include "timers.h"
 
-/* Priorities at which the tasks are created. */
-#define mainQUEUE_RECEIVE_TASK_PRIORITY    ( tskIDLE_PRIORITY + 2 )
-#define mainQUEUE_SEND_TASK_PRIORITY       ( tskIDLE_PRIORITY + 1 )
-
-/* The rate at which data is sent to the queue.  The times are converted from
- * milliseconds to ticks using the pdMS_TO_TICKS() macro. */
-#define mainTASK_SEND_FREQUENCY_MS         pdMS_TO_TICKS( 200UL )
-#define mainTIMER_SEND_FREQUENCY_MS        pdMS_TO_TICKS( 2000UL )
-
- /* The number of items the queue can hold at once. */
-#define mainQUEUE_LENGTH                   ( 2 )
-
-/* The values sent to the queue receive task from the queue send task and the
- * queue send software timer respectively. */
-#define mainVALUE_SENT_FROM_TASK           ( 100UL )
-#define mainVALUE_SENT_FROM_TIMER          ( 200UL )
-
- /* This demo allows for users to perform actions with the keyboard. */
-#define mainNO_KEY_PRESS_VALUE             ( -1 )
-#define mainRESET_TIMER_KEY                ( 'r' )
-
-/*-----------------------------------------------------------*/
-
+/* Task prototypes. */
 static void prvQueueReceiveTask(void* pvParameters);
 static void prvQueueSendTask(void* pvParameters);
 static void prvAlarmTask(void* pvParameters);
-
-/*
- * The callback function executed when the software timer expires.
- */
-static void prvQueueSendTimerCallback(TimerHandle_t xTimerHandle);
-
-/*-----------------------------------------------------------*/
-
-
+static void prvWatchdogTask(void* pvParameters);
+static void prvCheckTask(void* pvParameters);
+static void prvCheckTimerCallback(TimerHandle_t xTimer);
 
 typedef struct
 {
@@ -77,71 +20,140 @@ typedef struct
     float temperature;
 } Measurement;
 
+/* Shared RTOS objects. */
 static QueueHandle_t xQueue = NULL;
 static SemaphoreHandle_t xAlarmSemaphore = NULL;
 static SemaphoreHandle_t xConsoleMutex = NULL;
-typedef enum // <--- tutaj modyfikacja.
-{
-    alarmTemperature, // <--- tutaj modyfikacja.
-    sensorFailure, // <--- tutaj modyfikacja.
-    sensorRecovery // <--- tutaj modyfikacja.
-} AlarmEvent_t; // <--- tutaj modyfikacja.
+static SemaphoreHandle_t xSensorActivitySemaphore = NULL;
+static SemaphoreHandle_t xCheckSemaphore = NULL;
+static TimerHandle_t xCheckTimer = NULL;
 
-static volatile AlarmEvent_t xAlarmEvent = alarmTemperature; // <--- tutaj modyfikacja.
-static volatile BaseType_t xSensorFailureDetected = pdFALSE; // <--- tutaj modyfikacja.
 /*-----------------------------------------------------------*/
-
 
 void main_blinky(void)
 {
     printf("\r\nTemperature control\r\n\r\n");
 
-    /* Create the queue for Measurement structures. */
-    xQueue = xQueueCreate(1, sizeof(Measurement)); // <--- tutaj modyfikacja.
+    /* Queue: maximum 3 measurements. */
+    xQueue = xQueueCreate(3, sizeof(Measurement));
 
-    /* Create a counting semaphore and a mutex. */
+    /* Counting semaphore: maximum 5 pending alarm events. */
     xAlarmSemaphore = xSemaphoreCreateCounting(5, 0);
+
+    /* Binary semaphore: Sensor activity notification. */
+    xSensorActivitySemaphore = xSemaphoreCreateBinary();
+
+    /* Binary semaphore: periodic system check notification. */
+    xCheckSemaphore = xSemaphoreCreateBinary();
+
+    /* Mutex: protects shared console output. */
     xConsoleMutex = xSemaphoreCreateMutex();
 
-    if ((xQueue != NULL) &&
-        (xAlarmSemaphore != NULL) &&
-        (xConsoleMutex != NULL))
+    /* Periodic software timer: 2000 ms. */ // <---- tutaj zmiana (zmiana okresu timera na 2000 ms)
+    xCheckTimer = xTimerCreate(
+        "CheckTimer",
+        pdMS_TO_TICKS(2000UL), // <---- tutaj zmiana (timer zgłasza zdarzenie co 2000 ms)
+        pdTRUE,
+        NULL,
+        prvCheckTimerCallback
+    );
+
+    /* Check that all RTOS objects were created. */
+    if ((xQueue == NULL) ||
+        (xAlarmSemaphore == NULL) ||
+        (xSensorActivitySemaphore == NULL) ||
+        (xCheckSemaphore == NULL) ||
+        (xConsoleMutex == NULL) ||
+        (xCheckTimer == NULL))
     {
-        xTaskCreate(
-            prvQueueReceiveTask,
-            "Sensor",
-            configMINIMAL_STACK_SIZE,
-            NULL,
-            tskIDLE_PRIORITY + 1,
-            NULL
-        );
+        printf("ERROR: Could not create RTOS objects.\r\n");
 
-        xTaskCreate(
-            prvQueueSendTask,
-            "Monitoring",
-            configMINIMAL_STACK_SIZE,
-            NULL,
-            tskIDLE_PRIORITY + 2,
-            NULL
-        );
-
-        xTaskCreate(
-            prvAlarmTask,
-            "Alarm",
-            configMINIMAL_STACK_SIZE,
-            NULL,
-            tskIDLE_PRIORITY + 3,
-            NULL
-        );
-
-        vTaskStartScheduler();
+        for (;;)
+        {
+        }
     }
-    else
+
+    /* Create Sensor task. */
+    if (xTaskCreate(
+        prvQueueReceiveTask,
+        "Sensor",
+        configMINIMAL_STACK_SIZE,
+        NULL,
+        tskIDLE_PRIORITY + 1,
+        NULL) != pdPASS)
     {
-        printf("Error creating queue or semaphore\n");
+        printf("ERROR: Could not create Sensor task.\r\n");
+        for (;;)
+        {
+        }
     }
+
+    /* Create Monitoring task. */
+    if (xTaskCreate(
+        prvQueueSendTask,
+        "Monitoring",
+        configMINIMAL_STACK_SIZE,
+        NULL,
+        tskIDLE_PRIORITY + 2,
+        NULL) != pdPASS)
+    {
+        printf("ERROR: Could not create Monitoring task.\r\n");
+        for (;;)
+        {
+        }
+    }
+
+    /* Create Alarm task. */
+    if (xTaskCreate(
+        prvAlarmTask,
+        "Alarm",
+        configMINIMAL_STACK_SIZE,
+        NULL,
+        tskIDLE_PRIORITY + 3,
+        NULL) != pdPASS)
+    {
+        printf("ERROR: Could not create Alarm task.\r\n");
+        for (;;)
+        {
+        }
+    }
+
+    /* Create Watchdog task. */
+    if (xTaskCreate(
+        prvWatchdogTask,
+        "Watchdog",
+        configMINIMAL_STACK_SIZE,
+        NULL,
+        tskIDLE_PRIORITY + 2,
+        NULL) != pdPASS)
+    {
+        printf("ERROR: Could not create Watchdog task.\r\n");
+        for (;;)
+        {
+        }
+    }
+
+    /* Create periodic system check task. */
+    if (xTaskCreate(
+        prvCheckTask,
+        "CheckTask",
+        configMINIMAL_STACK_SIZE,
+        NULL,
+        tskIDLE_PRIORITY + 1,
+        NULL) != pdPASS)
+    {
+        printf("ERROR: Could not create CheckTask.\r\n");
+        for (;;)
+        {
+        }
+    }
+
+    /* Start the scheduler only after creating all objects and tasks. */
+    vTaskStartScheduler();
 
     /* Reaching this point means the scheduler did not start. */
+    printf("ERROR: Could not start the scheduler.\r\n");
+
     for (;;)
     {
     }
@@ -149,11 +161,11 @@ void main_blinky(void)
 
 /*-----------------------------------------------------------*/
 
-
+/* Generates measurements and signals alarm events. */
 static void prvQueueSendTask(void* pvParameters)
 {
     TickType_t xNextWakeTime;
-    const TickType_t xPeriod = pdMS_TO_TICKS(500);  // <--- tutaj modyfikacja.
+    const TickType_t xPeriod = pdMS_TO_TICKS(500UL);
 
     uint32_t counter = 0;
     Measurement m;
@@ -166,76 +178,102 @@ static void prvQueueSendTask(void* pvParameters)
     {
         vTaskDelayUntil(&xNextWakeTime, xPeriod);
 
-        /* Generate the next measurement. */
         counter++;
         m.measurementNo = counter;
         m.temperature = 65.0f + (float)(counter % 25);
 
-        /* Send the measurement to the queue. */
-        if (xQueueOverwrite(xQueue, &m) == pdPASS) // <--- tutaj modyfikacja.
+        /* Send measurement without waiting for free queue space. */
+        if (xQueueSend(xQueue, &m, 0) == pdPASS)
         {
             if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
             {
                 printf(
-                    "Monitoring: measurement %lu, temperature %.1f C\n",
+                    "Monitoring: measurement %lu, temperature %.1f C\r\n",
                     (unsigned long)m.measurementNo,
                     (double)m.temperature
                 );
-                
-                xSemaphoreGive(xConsoleMutex);
-            }
 
-            /* Send several signals if temperature exceeds 75 C. */
-            if (m.temperature > 75.0f) // <--- tutaj modyfikacja.
-            {
-                xAlarmEvent = alarmTemperature; // <--- tutaj modyfikacja.
-                xSemaphoreGive(xAlarmSemaphore);
-                xSemaphoreGive(xAlarmSemaphore);
-                xSemaphoreGive(xAlarmSemaphore);
+                xSemaphoreGive(xConsoleMutex);
             }
         }
         else
         {
             if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
             {
-                printf("Monitoring: queue is full!\n");
-                xSemaphoreGive(xConsoleMutex);
-            }
-        }
-    }
-}
-
-
-static void prvAlarmTask(void* pvParameters)
-{
-    (void)pvParameters;
-
-    for (;;)
-    {
-        if (xSemaphoreTake(
-            xAlarmSemaphore,
-            portMAX_DELAY) == pdPASS)
-        {
-            if (xSemaphoreTake(
-                xConsoleMutex,
-                portMAX_DELAY) == pdPASS)
-            {
                 printf(
-                    xAlarmEvent == alarmTemperature
-                        ? "\n!!! ALARM: temperatura przekroczyla prog alarmowy 75 C \n\n" // <--- tutaj modyfikacja.
-                        : (xAlarmEvent == sensorFailure
-                            ? "\n!!! AWARIA: brak nowych pomiarow z czujnika !!!\n\n" // <--- tutaj modyfikacja.
-                            : "\nCzujnik ponownie wysyla pomiary. Powrot do pracy.\n\n") // <--- tutaj modyfikacja.
+                    "Monitoring: queue full; measurement %lu was not sent\r\n",
+                    (unsigned long)m.measurementNo
                 );
 
                 xSemaphoreGive(xConsoleMutex);
             }
         }
+
+        /* Signal an alarm for each generated measurement above 75 C. */
+        if (m.temperature > 75.0f)
+        {
+            if (xSemaphoreGive(xAlarmSemaphore) == pdPASS)
+            {
+                if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+                {
+                    printf(
+                        "Monitoring: alarm event registered, measurement %lu\r\n",
+                        (unsigned long)m.measurementNo
+                    );
+
+                    xSemaphoreGive(xConsoleMutex);
+                }
+            }
+            else
+            {
+                if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+                {
+                    printf("Monitoring: counting semaphore is full!\r\n");
+                    xSemaphoreGive(xConsoleMutex);
+                }
+            }
+        }
     }
 }
+
 /*-----------------------------------------------------------*/
 
+/* Consumes pending alarm signals and counts handled events. */
+static void prvAlarmTask(void* pvParameters)
+{
+    uint32_t handledAlarms = 0;
 
+    (void)pvParameters;
+
+    for (;;)
+    {
+        if (xSemaphoreTake(xAlarmSemaphore, portMAX_DELAY) == pdPASS)
+        {
+            handledAlarms++;
+
+            if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+            {
+                printf(
+                    "ALARM: temperature exceeded 75 C! "
+                    "Handled alarm events: %lu\r\n",
+                    (unsigned long)handledAlarms
+                );
+
+                xSemaphoreGive(xConsoleMutex);
+            }
+
+            /*
+             * Experimental delay: allows alarm events to accumulate.
+             * Remove it after completing the semaphore experiment.
+             */
+            vTaskDelay(pdMS_TO_TICKS(1500UL));
+        }
+    }
+}
+
+/*-----------------------------------------------------------*/
+
+/* Receives measurements and signals Sensor activity. */
 static void prvQueueReceiveTask(void* pvParameters)
 {
     Measurement m;
@@ -244,39 +282,69 @@ static void prvQueueReceiveTask(void* pvParameters)
 
     for (;;)
     {
-        /* Wait for a measurement from the queue. */
-        if (xQueueReceive( // <--- tutaj modyfikacja.
-            xQueue,
-            &m,
-            pdMS_TO_TICKS(1500)) == pdPASS) // <--- tutaj modyfikacja system zglasza awarie po 1500 ms.
+        if (xQueueReceive(xQueue, &m, portMAX_DELAY) == pdPASS)
         {
-            if (xSensorFailureDetected == pdTRUE) // <--- tutaj modyfikacja.
-            {
-                xSensorFailureDetected = pdFALSE; // <--- tutaj modyfikacja.
-                xAlarmEvent = sensorRecovery; // <--- tutaj modyfikacja.
-                xSemaphoreGive(xAlarmSemaphore); // <--- tutaj modyfikacja.
-            }
-
-            if (xSemaphoreTake(
-                xConsoleMutex,
-                portMAX_DELAY) == pdPASS)
+            if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
             {
                 printf(
-                    "Sensor: received measurement %lu, temperature %.1f C\n",
+                    "Sensor: received measurement %lu, temperature %.1f C\r\n",
                     (unsigned long)m.measurementNo,
                     (double)m.temperature
                 );
 
                 xSemaphoreGive(xConsoleMutex);
             }
+
+            /* Notify Watchdog that Sensor received a measurement. */
+            (void)xSemaphoreGive(xSensorActivitySemaphore);
         }
-        else 
+    }
+}
+
+/*-----------------------------------------------------------*/
+
+/* Detects if Sensor stops receiving measurements for 1500 ms. */
+static void prvWatchdogTask(void* pvParameters)
+{
+    BaseType_t xSensorFailed = pdFALSE;
+
+    (void)pvParameters;
+
+    for (;;)
+    {
+        BaseType_t xReceived = xSemaphoreTake(
+            xSensorActivitySemaphore,
+            pdMS_TO_TICKS(1500UL)
+        );
+
+        if (xReceived == pdPASS)
         {
-            if (xSensorFailureDetected == pdFALSE) // <--- tutaj modyfikacja.
+            if (xSensorFailed == pdTRUE)
             {
-                xSensorFailureDetected = pdTRUE; // <--- tutaj modyfikacja.
-                xAlarmEvent = sensorFailure; // <--- tutaj modyfikacja.
-                xSemaphoreGive(xAlarmSemaphore); // <--- tutaj modyfikacja.
+                xSensorFailed = pdFALSE;
+
+                if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+                {
+                    printf("Watchdog: sensor has resumed operation\r\n");
+                    xSemaphoreGive(xConsoleMutex);
+                }
+            }
+        }
+        else
+        {
+            if (xSensorFailed == pdFALSE)
+            {
+                xSensorFailed = pdTRUE;
+
+                if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+                {
+                    printf(
+                        "Watchdog: SENSOR FAILURE - "
+                        "no measurement for 1500 ms!\r\n"
+                    );
+
+                    xSemaphoreGive(xConsoleMutex);
+                }
             }
         }
     }
@@ -284,8 +352,64 @@ static void prvQueueReceiveTask(void* pvParameters)
 
 /*-----------------------------------------------------------*/
 
-/* Called from prvKeyboardInterruptSimulatorTask(), which is defined in main.c. */
+/* Called by the keyboard simulator in the Win32 demo. */
 void vBlinkyKeyboardInterruptHandler(int xKeyPressed)
 {
     (void)xKeyPressed;
+}
+
+/*-----------------------------------------------------------*/
+
+/* Timer callback: signals CheckTask; does not print to console. */
+static void prvCheckTimerCallback(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+
+    (void)xSemaphoreGive(xCheckSemaphore);
+}
+
+/*-----------------------------------------------------------*/
+
+/* Performs a periodic system check every 2000 ms. */ // <---- tutaj zmiana (aktualizacja opisu częstotliwości CheckTask)
+static void prvCheckTask(void* pvParameters)
+{
+    uint32_t checkNo = 0;
+
+    (void)pvParameters;
+
+    /* Start the timer after the scheduler has started. */
+    if (xTimerStart(xCheckTimer, 0) != pdPASS)
+    {
+        if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+        {
+            printf("CheckTask: ERROR - could not start timer.\r\n");
+            xSemaphoreGive(xConsoleMutex);
+        }
+
+        vTaskDelete(NULL);
+        return;
+    }
+
+    for (;;)
+    {
+        if (xSemaphoreTake(xCheckSemaphore, portMAX_DELAY) == pdPASS)
+        {
+            checkNo++;
+
+            if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+            {
+                printf(
+                    "CheckTask: periodic system check no. %lu\r\n",
+                    (unsigned long)checkNo
+                );
+
+                xSemaphoreGive(xConsoleMutex);
+            }
+        }
+    }
+}
+
+static void prvAlarmTimerCallback(void* pvParameters)
+{
+
 }
