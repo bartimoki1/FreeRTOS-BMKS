@@ -6,6 +6,11 @@
 #include "semphr.h"
 #include "timers.h"
 
+/* Definicja do wyboru mechanizmu ochrony zasobu współdzielonego */
+/* Zmień na 0 dla Zadania nr 2 (semafor binarny - inwersja priorytetów) */
+/* Zmień na 1 dla Zadania nr 3 (muteks - dziedziczenie priorytetów) */
+#define USE_MUTEX 1 
+
 /* Task prototypes. */
 static void prvQueueReceiveTask(void* pvParameters);
 static void prvQueueSendTask(void* pvParameters);
@@ -13,6 +18,11 @@ static void prvAlarmTask(void* pvParameters);
 static void prvWatchdogTask(void* pvParameters);
 static void prvCheckTask(void* pvParameters);
 static void prvCheckTimerCallback(TimerHandle_t xTimer);
+static void prvAlarmTimerCallback(TimerHandle_t xTimer);
+
+/* Prototypy dla Zadania nr 5 (Zarządzanie pamięcią) */ // <---- tutaj zmiana (dodano deklaracje nowych zadań eksperymentalnych)
+static void prvMemoryTask(void* pvParameters); // <---- tutaj zmiana
+static void prvDummyTask(void* pvParameters);  // <---- tutaj zmiana
 
 typedef struct
 {
@@ -27,6 +37,7 @@ static SemaphoreHandle_t xConsoleMutex = NULL;
 static SemaphoreHandle_t xSensorActivitySemaphore = NULL;
 static SemaphoreHandle_t xCheckSemaphore = NULL;
 static TimerHandle_t xCheckTimer = NULL;
+static TimerHandle_t xAlarmTimer = NULL;
 
 /*-----------------------------------------------------------*/
 
@@ -37,8 +48,8 @@ void main_blinky(void)
     /* Queue: maximum 3 measurements. */
     xQueue = xQueueCreate(3, sizeof(Measurement));
 
-    /* Counting semaphore: maximum 5 pending alarm events. */
-    xAlarmSemaphore = xSemaphoreCreateCounting(5, 0);
+    /* Binary semaphore for alarm timer event */
+    xAlarmSemaphore = xSemaphoreCreateBinary();
 
     /* Binary semaphore: Sensor activity notification. */
     xSensorActivitySemaphore = xSemaphoreCreateBinary();
@@ -46,16 +57,34 @@ void main_blinky(void)
     /* Binary semaphore: periodic system check notification. */
     xCheckSemaphore = xSemaphoreCreateBinary();
 
-    /* Mutex: protects shared console output. */
+#if USE_MUTEX == 1 
+    /* Mutex: protects shared console output. Wspiera dziedziczenie priorytetów. */
     xConsoleMutex = xSemaphoreCreateMutex();
+#else 
+    /* Binary semaphore: protects shared console output. Powoduje inwersję priorytetów (Zadanie 2). */
+    xConsoleMutex = xSemaphoreCreateBinary();
+    if (xConsoleMutex != NULL)
+    {
+        xSemaphoreGive(xConsoleMutex);
+    }
+#endif 
 
-    /* Periodic software timer: 2000 ms. */ // <---- tutaj zmiana (zmiana okresu timera na 2000 ms)
+    /* Periodic software timer: 2000 ms. */
     xCheckTimer = xTimerCreate(
         "CheckTimer",
-        pdMS_TO_TICKS(2000UL), // <---- tutaj zmiana (timer zgłasza zdarzenie co 2000 ms)
+        pdMS_TO_TICKS(2000UL),
         pdTRUE,
         NULL,
         prvCheckTimerCallback
+    );
+
+    /* Software timer for alarm events: 1000 ms */
+    xAlarmTimer = xTimerCreate(
+        "AlarmTimer",
+        pdMS_TO_TICKS(1000UL),
+        pdTRUE,
+        NULL,
+        prvAlarmTimerCallback
     );
 
     /* Check that all RTOS objects were created. */
@@ -64,7 +93,8 @@ void main_blinky(void)
         (xSensorActivitySemaphore == NULL) ||
         (xCheckSemaphore == NULL) ||
         (xConsoleMutex == NULL) ||
-        (xCheckTimer == NULL))
+        (xCheckTimer == NULL) ||
+        (xAlarmTimer == NULL))
     {
         printf("ERROR: Could not create RTOS objects.\r\n");
 
@@ -73,7 +103,7 @@ void main_blinky(void)
         }
     }
 
-    /* Create Sensor task. */
+    /* Create Sensor task. (TaskLow - priority 1) */
     if (xTaskCreate(
         prvQueueReceiveTask,
         "Sensor",
@@ -88,7 +118,7 @@ void main_blinky(void)
         }
     }
 
-    /* Create Monitoring task. */
+    /* Create Monitoring task. (TaskMedium - priority 2) */
     if (xTaskCreate(
         prvQueueSendTask,
         "Monitoring",
@@ -103,7 +133,7 @@ void main_blinky(void)
         }
     }
 
-    /* Create Alarm task. */
+    /* Create Alarm task. (TaskHigh - priority 3) */
     if (xTaskCreate(
         prvAlarmTask,
         "Alarm",
@@ -118,7 +148,7 @@ void main_blinky(void)
         }
     }
 
-    /* Create Watchdog task. */
+    /* Create Watchdog task. (TaskMedium - priority 2) */
     if (xTaskCreate(
         prvWatchdogTask,
         "Watchdog",
@@ -133,7 +163,7 @@ void main_blinky(void)
         }
     }
 
-    /* Create periodic system check task. */
+    /* Create periodic system check task. (TaskLow - priority 1) */
     if (xTaskCreate(
         prvCheckTask,
         "CheckTask",
@@ -143,6 +173,21 @@ void main_blinky(void)
         NULL) != pdPASS)
     {
         printf("ERROR: Could not create CheckTask.\r\n");
+        for (;;)
+        {
+        }
+    }
+
+    /* Create Memory experiment task (Zadanie nr 5). */ // <---- tutaj zmiana (utworzenie zadania testującego zarządzanie pamięcią)
+    if (xTaskCreate(
+        prvMemoryTask,
+        "MemoryTask",
+        configMINIMAL_STACK_SIZE,
+        NULL,
+        tskIDLE_PRIORITY + 1,
+        NULL) != pdPASS)
+    {
+        printf("ERROR: Could not create MemoryTask.\r\n");
         for (;;)
         {
         }
@@ -161,7 +206,7 @@ void main_blinky(void)
 
 /*-----------------------------------------------------------*/
 
-/* Generates measurements and signals alarm events. */
+/* Generates measurements. */
 static void prvQueueSendTask(void* pvParameters)
 {
     TickType_t xNextWakeTime;
@@ -173,6 +218,15 @@ static void prvQueueSendTask(void* pvParameters)
     (void)pvParameters;
 
     xNextWakeTime = xTaskGetTickCount();
+
+    if (xTimerStart(xAlarmTimer, 0) != pdPASS)
+    {
+        if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+        {
+            printf("Monitoring: ERROR - could not start AlarmTimer.\r\n");
+            xSemaphoreGive(xConsoleMutex);
+        }
+    }
 
     for (;;)
     {
@@ -208,31 +262,6 @@ static void prvQueueSendTask(void* pvParameters)
                 xSemaphoreGive(xConsoleMutex);
             }
         }
-
-        /* Signal an alarm for each generated measurement above 75 C. */
-        if (m.temperature > 75.0f)
-        {
-            if (xSemaphoreGive(xAlarmSemaphore) == pdPASS)
-            {
-                if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
-                {
-                    printf(
-                        "Monitoring: alarm event registered, measurement %lu\r\n",
-                        (unsigned long)m.measurementNo
-                    );
-
-                    xSemaphoreGive(xConsoleMutex);
-                }
-            }
-            else
-            {
-                if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
-                {
-                    printf("Monitoring: counting semaphore is full!\r\n");
-                    xSemaphoreGive(xConsoleMutex);
-                }
-            }
-        }
     }
 }
 
@@ -254,7 +283,7 @@ static void prvAlarmTask(void* pvParameters)
             if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
             {
                 printf(
-                    "ALARM: temperature exceeded 75 C! "
+                    "ALARM: timer event received! "
                     "Handled alarm events: %lu\r\n",
                     (unsigned long)handledAlarms
                 );
@@ -262,11 +291,7 @@ static void prvAlarmTask(void* pvParameters)
                 xSemaphoreGive(xConsoleMutex);
             }
 
-            /*
-             * Experimental delay: allows alarm events to accumulate.
-             * Remove it after completing the semaphore experiment.
-             */
-            vTaskDelay(pdMS_TO_TICKS(1500UL));
+            // vTaskDelay(pdMS_TO_TICKS(1500UL)); 
         }
     }
 }
@@ -370,7 +395,7 @@ static void prvCheckTimerCallback(TimerHandle_t xTimer)
 
 /*-----------------------------------------------------------*/
 
-/* Performs a periodic system check every 2000 ms. */ // <---- tutaj zmiana (aktualizacja opisu częstotliwości CheckTask)
+/* Performs a periodic system check every 2000 ms. */
 static void prvCheckTask(void* pvParameters)
 {
     uint32_t checkNo = 0;
@@ -409,7 +434,86 @@ static void prvCheckTask(void* pvParameters)
     }
 }
 
-static void prvAlarmTimerCallback(void* pvParameters)
+static void prvAlarmTimerCallback(TimerHandle_t xTimer)
 {
+    (void)xTimer;
 
+    (void)xSemaphoreGive(xAlarmSemaphore);
 }
+
+/*-----------------------------------------------------------*/
+// <---- tutaj zmiana (początek implementacji dla Zadania 5)
+
+/* Zadanie pomocnicze, nic nie robi, zajmuje tylko pamięć w celu demonstracji */
+static void prvDummyTask(void* pvParameters)
+{
+    (void)pvParameters;
+    for (;;)
+    {
+        /* Zwykłe oczekiwanie w pętli */
+        vTaskDelay(pdMS_TO_TICKS(1000UL));
+    }
+}
+
+/* Zadanie realizujące scenariusz z Zadania nr 5 - wykonuje się tylko raz po starcie systemu */
+static void prvMemoryTask(void* pvParameters)
+{
+    TaskHandle_t xDummyHandle = NULL;
+    size_t xFreeHeap;
+
+    (void)pvParameters;
+
+    /* Dajemy chwilę na pełne uruchomienie innych zadań */
+    vTaskDelay(pdMS_TO_TICKS(100UL));
+
+    /* 1. Odczytaj ilość wolnej pamięci przed utworzeniem zadania */
+    xFreeHeap = xPortGetFreeHeapSize();
+    if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+    {
+        printf("Zadanie 5: Wolna pamiec przed xTaskCreate(): %u bajtow\r\n", (unsigned int)xFreeHeap);
+        xSemaphoreGive(xConsoleMutex);
+    }
+
+    /* 2. Utwórz dodatkowe zadanie za pomocą xTaskCreate() i sprawdź wynik */
+    if (xTaskCreate(prvDummyTask, "Dummy", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, &xDummyHandle) == pdPASS)
+    {
+        /* 3. Ponownie odczytaj ilość wolnej pamięci i porównaj z pomiarem początkowym */
+        xFreeHeap = xPortGetFreeHeapSize();
+        if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+        {
+            printf("Zadanie 5: Wolna pamiec po utworzeniu zadania Dummy: %u bajtow\r\n", (unsigned int)xFreeHeap);
+            xSemaphoreGive(xConsoleMutex);
+        }
+
+        /* 4. Sprawdź, co dzieje się po usunięciu zadania za pomocą vTaskDelete() */
+        vTaskDelete(xDummyHandle);
+        if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+        {
+            printf("Zadanie 5: Usunieto zadanie Dummy (vTaskDelete). Czekam na reakcje zadania Idle...\r\n");
+            xSemaphoreGive(xConsoleMutex);
+        }
+
+        /* 5. Czekamy, aby zadanie Idle (priorytet 0) otrzymało czas procesora i zwolniło pamięć */
+        vTaskDelay(pdMS_TO_TICKS(100UL));
+
+        /* 6. Odczyt wolnej pamięci po zwolnieniu zasobów przez zadanie Idle */
+        xFreeHeap = xPortGetFreeHeapSize();
+        if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+        {
+            printf("Zadanie 5: Wolna pamiec po interwencji zadania Idle: %u bajtow\r\n", (unsigned int)xFreeHeap);
+            xSemaphoreGive(xConsoleMutex);
+        }
+    }
+    else
+    {
+        if (xSemaphoreTake(xConsoleMutex, portMAX_DELAY) == pdPASS)
+        {
+            printf("Zadanie 5: BLAD! xTaskCreate() zwrocil blad (np. z powodu braku pamieci na stercie).\r\n");
+            xSemaphoreGive(xConsoleMutex);
+        }
+    }
+
+    /* Zakończ zadanie eksperymentalne, zwalniając je (pamięć z niego zostanie zwolniona w kolejnym wywołaniu Idle taska) */
+    vTaskDelete(NULL);
+}
+// <---- tutaj zmiana (koniec implementacji dla Zadania 5)
